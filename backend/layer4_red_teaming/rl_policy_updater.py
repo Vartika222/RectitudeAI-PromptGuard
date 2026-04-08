@@ -14,6 +14,14 @@ Improvements over baseline:
     fields; interactive_review() and auto-approve both target same structure
   - Continuous training loop reads replay_buffer.jsonl when present
 
+FIX: _run_quick_redteam() now seeds its corpus from the persisted
+bypassed_prompts in the vulnerability report (which now includes JailbreakBench
+bypasses) instead of always using only the 22 built-in attacks. This means the
+RL agent's reward signal actually reflects real-world bypass rates, not a smoke
+test it was already passing. The heuristic proposal thresholds also now read
+jbb_attack_success_rate so a 53% JailbreakBench bypass rate correctly triggers
+threshold tightening and pattern suggestions.
+
 Architecture (unchanged externals):
   PolicyStore.get("block_threshold")    → policy_engine.py each request
   PolicyStore.get("escalate_threshold") → policy_engine.py each request
@@ -243,6 +251,50 @@ def _bypass_by_category(report: dict) -> Dict[str, float]:
     return {c: counts[c] / max(totals[c], 1) for c in ATTACK_CATEGORIES}
 
 
+def _build_rl_corpus(report: Optional[dict] = None) -> list:
+    """
+    Build the corpus the RL agent uses as its reward environment.
+
+    FIX: Previously this always fell back to BUILTIN_ATTACKS (22 prompts,
+    all already blocked → ASR always 0% → no reward signal → no proposals).
+
+    Now:
+      1. Use bypassed_prompts from the report as the primary source. This
+         includes both built-in and JailbreakBench bypasses (merged in
+         attack_runner.py) so the RL agent trains on prompts that are
+         actually slipping through.
+      2. Always include BUILTIN_ATTACKS so legit samples are present for
+         FPR measurement.
+      3. Fall back to BUILTIN_ATTACKS alone only if the report has no
+         bypassed prompts at all (e.g. first run before redteam is run).
+    """
+    from backend.layer4_red_teaming.attack_runner import BUILTIN_ATTACKS
+
+    if report and report.get("bypassed_prompts"):
+        bypassed = report["bypassed_prompts"]
+        # Rebuild as proper attack dicts. bypassed_prompts entries already
+        # have id/category/prompt so they're compatible with BUILTIN_ATTACKS.
+        bypassed_as_attacks = [
+            {
+                "id":       b.get("id", f"BYP_{i:04d}"),
+                "category": b.get("category", "jailbreakbench"),
+                "prompt":   b["prompt"],
+            }
+            for i, b in enumerate(bypassed)
+        ]
+        # Merge: bypassed attacks (the hard ones) + built-ins (includes legit
+        # samples needed for FPR measurement).
+        merged = bypassed_as_attacks + list(BUILTIN_ATTACKS)
+        logger.info(
+            "RL corpus: %d bypassed prompts + %d built-ins = %d total",
+            len(bypassed_as_attacks), len(BUILTIN_ATTACKS), len(merged),
+        )
+        return merged
+
+    logger.info("RL corpus: no bypassed_prompts in report — using BUILTIN_ATTACKS only")
+    return list(BUILTIN_ATTACKS)
+
+
 def _run_quick_redteam(
     custom_patterns: List[str],
     block_thresh: float,
@@ -252,10 +304,16 @@ def _run_quick_redteam(
     """
     Score the current policy against the corpus.
     Returns (asr, fpr, ml_tier_fraction).
+
+    FIX: corpus now defaults to _build_rl_corpus() which includes JailbreakBench
+    bypasses instead of always defaulting to BUILTIN_ATTACKS. When all 22
+    built-ins are blocked (ASR=0%), the RL environment had zero reward signal
+    and produced no proposals. Now the corpus is seeded from prompts that are
+    actually bypassing the pipeline.
     """
     if corpus is None:
-        from backend.layer4_red_teaming.attack_runner import BUILTIN_ATTACKS
-        corpus = BUILTIN_ATTACKS
+        report = _load_report()
+        corpus = _build_rl_corpus(report)
 
     compiled_custom = []
     for p in custom_patterns:
@@ -267,8 +325,7 @@ def _run_quick_redteam(
     attack_samples = [a for a in corpus if a.get("category") != "legitimate"]
     legit_samples  = [a for a in corpus if a.get("category") == "legitimate"]
 
-    ml_hits = 0
-    total   = max(len(attack_samples) + len(legit_samples), 1)
+    total = max(len(attack_samples) + len(legit_samples), 1)
 
     def _classify(prompt: str) -> str:
         result = prefilter(prompt)
@@ -276,7 +333,6 @@ def _run_quick_redteam(
             for cp in compiled_custom:
                 if cp.search(prompt):
                     return "escalate"
-        # Approximate ML-tier fraction: escalate + borderline block
         return result.decision
 
     blocked, escalated_attacks = 0, 0
@@ -362,11 +418,14 @@ class RedTeamEnv(_GymBase):
         self._escalate = float(self._store.get("escalate_threshold", DEFAULT_ESCALATE))
         self._patterns: List[str] = list(self._store.get("custom_patterns", []))
 
-        # Build / expand corpus with mutations
-        base_corpus = corpus
-        if base_corpus is None:
-            from backend.layer4_red_teaming.attack_runner import BUILTIN_ATTACKS
-            base_corpus = BUILTIN_ATTACKS
+        # FIX: Build corpus from bypassed_prompts (includes JailbreakBench) so
+        # the environment's reward signal reflects actual bypass rates rather
+        # than always measuring the 22 built-ins at ASR=0%.
+        if corpus is not None:
+            base_corpus = corpus
+        else:
+            base_corpus = _build_rl_corpus(self._report)
+
         # Merge with any real-traffic replay buffer
         replay = _load_replay_buffer()
         merged = list(base_corpus) + replay
@@ -731,23 +790,47 @@ class RLPolicyUpdater:
         return self._rollout_agent(model, env, report)
 
     def _propose_heuristic(self, report: dict) -> List[PolicyUpdate]:
+        """
+        Rule-based proposals based on ASR/FPR thresholds.
+
+        FIX: Now reads jbb_attack_success_rate (JailbreakBench ASR) as the
+        primary signal when it's available. Previously this read only
+        attack_success_rate which was always 0.0% (built-in 22 attacks, all
+        blocked), so the thresholds asr > 0.20 and asr > 0.40 were never
+        triggered and the method always returned an empty list.
+
+        Priority: jbb_attack_success_rate > attack_success_rate
+        so the real adversarial bypass rate drives proposals, not the smoke test.
+        """
         updates: List[PolicyUpdate] = []
-        asr = report.get("attack_success_rate", 0.0)
+
+        # Use JailbreakBench ASR if available — it reflects real bypass rates.
+        # Fall back to built-in ASR for backwards compatibility.
+        jbb_asr = report.get("jbb_attack_success_rate")
+        builtin_asr = report.get("attack_success_rate", 0.0)
+        asr = jbb_asr if jbb_asr is not None else builtin_asr
         fpr = report.get("false_positive_rate", 0.0)
+
+        jbb_bypassed = report.get("jbb_bypassed", 0)
+        jbb_total    = report.get("jbb_total", 0)
+        source_label = (
+            f"JailbreakBench ({jbb_bypassed}/{jbb_total} bypassed)"
+            if jbb_total > 0 else "built-in corpus"
+        )
 
         if asr > 0.20 and fpr < 0.10:
             updates.append(PolicyUpdate(
                 action="adjust_threshold", target="escalate_threshold",
                 value=max(DEFAULT_ESCALATE - 0.05, ESCALATE_THRESH_MIN),
                 confidence=0.70,
-                reason=f"ASR {asr:.1%} > 20% with FPR headroom — tighten escalate",
+                reason=f"ASR {asr:.1%} > 20% [{source_label}] with FPR headroom — tighten escalate",
             ))
         if asr > 0.40:
             updates.append(PolicyUpdate(
                 action="adjust_threshold", target="block_threshold",
                 value=max(DEFAULT_BLOCK - 0.05, BLOCK_THRESH_MIN),
                 confidence=0.65,
-                reason=f"High ASR {asr:.1%} — tighten block threshold",
+                reason=f"High ASR {asr:.1%} [{source_label}] — tighten block threshold",
             ))
         if fpr > 0.15:
             updates.append(PolicyUpdate(
@@ -766,7 +849,7 @@ class RLPolicyUpdater:
                 updates.append(PolicyUpdate(
                     action="add_pattern", target="regex_prefilter",
                     value=candidate, confidence=0.55,
-                    reason="Validated pattern from red team bypass analysis",
+                    reason=f"Validated pattern from red team bypass analysis [{source_label}]",
                 ))
         return updates
 
@@ -956,10 +1039,19 @@ class RLPolicyUpdater:
             print("[RL] No vulnerability report. Run: python scripts/run_redteam.py")
             return []
 
-        asr = report.get("attack_success_rate", 0)
-        fpr = report.get("false_positive_rate", 0)
-        print(f"\n[RL] Report: ASR={asr:.1%}  FPR={fpr:.1%}  "
-              f"bypassed={report.get('attacks_bypassed','?')}")
+        builtin_asr = report.get("attack_success_rate", 0)
+        jbb_asr     = report.get("jbb_attack_success_rate")
+        fpr         = report.get("false_positive_rate", 0)
+        bypassed    = report.get("attacks_bypassed", "?")
+
+        # Show both ASRs so it's clear what the RL agent is working from
+        asr_display = f"builtin={builtin_asr:.1%}"
+        if jbb_asr is not None:
+            asr_display += f"  jbb={jbb_asr:.1%}"
+
+        print(f"\n[RL] Report: ASR({asr_display})  FPR={fpr:.1%}  "
+              f"bypassed={bypassed}  "
+              f"jbb_bypassed={report.get('jbb_bypassed', 'n/a')}")
 
         updates = self.propose_updates(report)
         self.save_proposals(updates)
