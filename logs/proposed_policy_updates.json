@@ -1,0 +1,22 @@
+[
+  {
+    "action": "adjust_threshold",
+    "target": "escalate_threshold",
+    "value": 0.45,
+    "confidence": 0.7,
+    "ensemble_agreement": 1.0,
+    "reason": "ASR 91.6% > 20% with FPR headroom \u2014 tighten escalate",
+    "approved": null,
+    "high_impact": false
+  },
+  {
+    "action": "adjust_threshold",
+    "target": "block_threshold",
+    "value": 0.75,
+    "confidence": 0.65,
+    "ensemble_agreement": 1.0,
+    "reason": "High ASR 91.6% \u2014 tighten block threshold",
+    "approved": null,
+    "high_impact": false
+  }
+]
